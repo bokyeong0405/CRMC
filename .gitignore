@@ -1,3 +1,8 @@
+__pycache__/
+*.pyc
+results/
+model/weights/
+
 resnet34_TinyImageNet/ResNet_tf.h5
 resnet34_TinyImageNet/ResNet_tf.index
 resnet34_TinyImageNet/ResNet_tf_v2.data-00000-of-00001
