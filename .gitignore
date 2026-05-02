@@ -1,7 +1,12 @@
 __pycache__/
 *.pyc
+.DS_Store
 results/
 model/weights/
+
+# Trained weights + accuracy lookup tables — too large for git, mounted into
+# containers via docker-compose volumes (see parameter/README references).
+parameter/
 
 resnet34_TinyImageNet/ResNet_tf.h5
 resnet34_TinyImageNet/ResNet_tf.index
