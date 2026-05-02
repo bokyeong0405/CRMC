@@ -1,138 +1,239 @@
 # CRMC-Docker: 분할 추론 정책 기반 분산 ResNet 추론 시스템
 
-기존 CRMC 시뮬레이션에서 평가했던 **다중 디바이스 분할 추론 정책(Split-point Partition Policy)** 을, 실제로 **도커 컨테이너로 분리된 서버들**이 정책에 따라 ResNet34 레이어를 나눠 계산하도록 확장하는 프로젝트입니다.
+[bokyeong0405/CRMC](https://github.com/bokyeong0405/CRMC) 의 GSPDA 시뮬레이션을 **실제 도커 컨테이너 5개로 구성된 분산 추론 시스템**으로 확장한 프로젝트입니다.
+
+User 컨테이너가 TinyImageNet 검증 이미지를 보내면 → Orchestrator가 각 서버의 자원/링크 상태를 보고 GSPDA 정책으로 분할 계획을 산출 → 3개 서버가 ResNet34 레이어를 나눠 순차적으로 추론 → User에게 최종 결과 반환합니다.
 
 ---
 
-## 1. 배경 (기존 CRMC 정리)
+## Quick Start
 
-기존 CRMC 코드(`resnet34_TinyImageNet/`)는 ResNet34 / TinyImageNet 환경에서 다음 요소를 고려한 **분할 추론(Split Computing) 정책**을 그래프 기반으로 시뮬레이션합니다.
+```bash
+# 0. 사전 준비: parameter/, data/ 폴더에 weight + validation .npy 배치
+#    (gitignore 처리되어 있어 별도로 옮겨와야 함, 아래 "데이터 준비" 참고)
 
-- **디바이스 3대** (`D1`, `D2`, `D3`)
-  - `D_C`: 디바이스별 연산 능력 (FLOPS)
-  - `D_tt`: 디바이스 간 전송 대역폭
-  - `D_BER`: 디바이스 간 통신 채널 BER
-- **ResNet34 레이어 분할 지점 (split point)** 을 노드로 갖는 가중치 그래프 위에서, 다음 정책들의 latency / energy / accuracy를 비교
-  - `GSPDA` — 본 논문이 제안한 그래프 기반 최단경로 분할 (정확도 임계치 + 에너지 임계치 만족 하에 추론 시간 최소)
-  - `low_BER` — 가장 BER이 낮은 디바이스로 오프로드
-  - `com_best` — 연산 성능이 가장 좋은 디바이스에 전부 할당
-  - `min_inter` — 중간 데이터(intermediate feature)가 가장 작은 분할점 사용
+# 1. 이미지 3개 빌드 (TF 다운로드 포함, 첫 빌드는 ~5분)
+docker compose build
 
-기존 코드는 어디까지나 **분석/시뮬레이션**이며, 실제 모델 가중치를 들고 디바이스들이 통신하면서 추론을 수행하지는 않습니다.
+# 2. 서버 3개 + orchestrator 백그라운드 기동
+docker compose up -d server-1 server-2 server-3 orchestrator
 
-## 2. 본 프로젝트의 목표
+# 3. 헬스체크 (호스트에서 직접)
+curl http://localhost:8080/healthz
 
-기존 시뮬레이션 결과를 **실측**으로 검증할 수 있는 형태로 옮깁니다.
+# 4. user 클라이언트로 추론 요청 10건 발사
+docker compose run --rm user
 
-- ResNet34 모델을 분할 가능한 형태로 정의
-- 정책이 출력한 split point와 디바이스 할당 결과를 입력으로 받아
-- 각 도커 컨테이너(서버)가 자기 책임 구간만 forward 한 뒤
-- 다음 컨테이너로 intermediate tensor를 전송하고
-- 마지막 컨테이너가 최종 logits / classification 결과를 반환
+# 5. 정리
+docker compose down
+```
 
-이를 통해 다음을 측정합니다.
+---
 
-| 항목 | 시뮬레이션 값 | 실측 값 |
+## 시스템 구성
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ docker network: crmc (bridge)                                        │
+│                                                                      │
+│  ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌──────────┐ │
+│  │  server-1  │    │  server-2  │    │  server-3  │    │   user   │ │
+│  │            │    │            │    │            │    │          │ │
+│  │ POWER=3    │    │ POWER=25   │    │ POWER=50   │    │ /data    │ │
+│  │ cpus=0.2   │    │ cpus=1.0   │    │ cpus=2.0   │    │  mount   │ │
+│  │ TF+FastAPI │    │ TF+FastAPI │    │ TF+FastAPI │    │ httpx    │ │
+│  └─────┬──────┘    └─────┬──────┘    └─────┬──────┘    └────┬─────┘ │
+│        │                  │                  │              │       │
+│        │  POST /run (forward chain, GSPDA-decided order)    │       │
+│        │   ┌──────────────┴──────────────────┘              │       │
+│        │   │                                                │       │
+│        │   │   ┌────────────────┐                           │       │
+│        └───┴───│  orchestrator  │◀──────POST /infer─────────┘       │
+│                │  GSPDA + plan  │                                   │
+│                │  /data/acc     │                                   │
+│                │  config.json   │                                   │
+│                └────────────────┘                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                             │
+                             │ port 8080 published to host (debug)
+                             ▼
+                          host machine
+```
+
+### 컴포넌트별 역할
+
+| 컨테이너 | 이미지 | 역할 |
 |---|---|---|
-| End-to-end inference latency | ✅ | ✅ (본 프로젝트) |
-| Per-device compute time | ✅ | ✅ |
-| Intermediate tensor 전송 시간 | ✅ | ✅ |
-| Top-1 / Top-5 accuracy | 예측치 | ✅ (실측 정답률) |
+| `server-1` / `-2` / `-3` | `crmc/device` (TF + FastAPI) | 동일 image, env로 `DEVICE_ID` / `COMPUTE_POWER` 다르게 주입. `/run` 엔드포인트가 자기 slice만 forward → 다음 hop으로 텐서 전달 |
+| `orchestrator` | `crmc/orchestrator` (numpy/scipy/sklearn/networkx, **TF 없음**) | 각 서버 `/capacity` 조회 → GSPDA로 split-plan 산출 → 첫 서버에 추론 위임 |
+| `user` | `crmc/user` (numpy + httpx) | 검증 이미지 N장 → orchestrator `/infer` POST → 정확도/latency 통계 출력 |
 
-## 3. 아키텍처
+### 데이터 흐름 (1 inference)
 
 ```
-                          ┌─────────────────────────┐
-                          │   Orchestrator (Host)   │
-                          │ - 정책 선택 (GSPDA 등)  │
-                          │ - split-plan 생성       │
-                          │ - 입력 이미지 송신      │
-                          └───────────┬─────────────┘
-                                      │ split-plan + image
-                                      ▼
-        ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
-        │  device-1      │───▶│  device-2      │───▶│  device-3      │
-        │  (container)   │    │  (container)   │    │  (container)   │
-        │  layers[0..a]  │    │  layers[a..b]  │    │  layers[b..N]  │
-        │  gRPC/HTTP     │    │  gRPC/HTTP     │    │  gRPC/HTTP     │
-        └────────────────┘    └────────────────┘    └────────────────┘
-                                                            │ logits
-                                                            ▼
-                                                       Orchestrator
+user                orchestrator             chain (예: server-1 → server-3 → server-2)
+  │                       │                                  │
+  │── POST /infer ────────▶ (1) GET /capacity × 3            │
+  │   {tensor_b64,...}    │     (lazy cache)                 │
+  │                       │ (2) compute_split_plan(D_C,..)   │
+  │                       │ (3) POST server-1 /run ──────────▶ slice 0 forward
+  │                       │     (multipart: meta+tensor)     │      │
+  │                       │                                  │      ▼
+  │                       │                       server-3 /run ──▶ slice 1
+  │                       │                                  │      │
+  │                       │                                  │      ▼
+  │                       │                       server-2 /run ──▶ slice 2
+  │                       │                                  │      │
+  │                       │   logits (Response 체인 반대로)   │      │
+  │                       │ ◀──────────────────────────────  │ ◀────┘
+  │ ◀─ JSON {logits,plan} ┤                                  │
 ```
 
-- **`orchestrator/`** — 정책 모듈(기존 CRMC 코드 포팅)을 호출해 split-plan을 만들고, 각 컨테이너를 호출하여 추론을 트리거 / 결과 수집
-- **`device/`** — 모든 디바이스가 공유하는 단일 추론 서버 이미지. 환경변수(`DEVICE_ID`, `LAYER_RANGE`, `NEXT_HOP_URL`)에 따라 자기 구간만 실행
-- **`model/`** — 분할 가능한 ResNet34 정의 (`forward_partial(x, start, end)`)와 학습된 weight
-- **`policy/`** — 기존 CRMC의 `GSPDA_resnet.py`, `scheme_*` 등을 포팅하여 `compute_split_plan(...)` 인터페이스로 노출
-- **`docker-compose.yml`** — `device-1`, `device-2`, `device-3`, `orchestrator` 4개 서비스를 하나의 사용자 정의 네트워크에서 기동. 디바이스별 자원 제약(`cpus`, `mem_limit`)으로 `D_C` 차이를 모사하고, `tc qdisc`로 링크 latency / loss 를 모사하여 `D_tt`, `D_BER` 도 재현
+---
 
-## 4. 동작 흐름
+## 시뮬레이션 매핑 (어디서 어떻게 쓰이는가)
 
-1. `docker compose up` → 3개 device 컨테이너가 모델 weight 로드 후 대기
-2. Orchestrator가 정책 모듈을 호출해 split plan 산출
-   ```
-   policy = "GSPDA"  # or "low_BER" | "com_best" | "min_inter"
-   plan = compute_split_plan(policy, D_C, D_tt, D_BER, acc_thresh, energy_thresh)
-   # plan 예시: [("device-1", 0, 7), ("device-3", 7, 18), ("device-2", 18, 34)]
-   ```
-3. Orchestrator가 첫 디바이스에 입력 이미지 + 전체 plan 전송
-4. 각 디바이스는 자기 구간의 layer를 forward → 다음 hop으로 intermediate tensor 전송
-5. 마지막 디바이스가 logits 반환 → Orchestrator가 latency / accuracy 기록
+| 시뮬레이션 변수 | 출처 | 본 시스템에서의 구현 |
+|---|---|---|
+| `D_C[i]` | server `/capacity` 응답 | `COMPUTE_POWER` env 값. 동시에 cgroup `cpus:` 제한으로 실제 추론 속도도 함께 차이남 |
+| `D_tt[i]` | `orchestrator/config.example.json` | 설정값으로만 GSPDA 입력에 들어감 (실제 링크 throttling은 미적용) |
+| `D_BER[i]` | 같은 config | 같음 (실제 패킷 손실 시뮬은 안 함 — TCP 재전송 때문에 의미 없음) |
+| `SS_f[i]` | `policy/constants.py` (정적) | ResNet34 split 별 FLOPs, 시뮬과 동일 |
+| `SS_d[i]` | `policy/constants.py` (정적) | intermediate tensor 크기, 시뮬과 동일 |
+| `acc_thresh` / `energy_thresh` | config | GSPDA의 후보 path 필터링 임계치 |
 
-## 5. 기존 시뮬레이션과의 매핑
+---
 
-| 기존 변수 | 실측 시스템에서의 구현 |
-|---|---|
-| `D_C[i]` (FLOPS) | `--cpus`, `--memory` 제약으로 모사 |
-| `D_tt[i]` (bandwidth) | `tc qdisc add ... rate ...` 로 인터페이스 대역폭 제한 |
-| `D_BER[i]` | `tc qdisc add ... loss ...` 로 패킷 손실 / 에러 모사 |
-| `SS_f[i]` (split별 FLOPs) | `model/resnet_split.py` 에서 실제 forward 시간 측정 |
-| `SS_d[i]` (intermediate data size) | 실제 직렬화된 tensor 바이트 수 측정 |
-
-## 6. 디렉터리 구조
+## 디렉터리 구조
 
 ```
 CRMC/
 ├── README.md
-├── resnet34_TinyImageNet/        # (기존) 시뮬레이션 / 정책 평가 코드
-│   ├── GSPDA_resnet.py
-│   ├── CRMC_eval_*.py
-│   ├── scheme_*.py
-│   └── ...
+├── docker-compose.yml             # 5개 서비스 + 네트워크 + 볼륨
+├── .gitignore                     # parameter/, data/ 제외
 │
-├── docker-compose.yml            # (예정) 3 device + orchestrator 구성
-├── orchestrator/                 # (예정)
-│   ├── Dockerfile
-│   ├── main.py
+├── model/                         # 분할 가능한 ResNet34 라이브러리
+│   ├── __init__.py
+│   └── resnet_split.py            # ResNet34, split_resnet, assign_weights, ...
+│
+├── policy/                        # GSPDA 정책 라이브러리
+│   ├── __init__.py
+│   ├── constants.py               # SS, SS_f, SS_d, start[], end[], END_TO_SPLIT_POINT
+│   ├── graph.py                   # create_graph (시뮬과 동일)
+│   ├── inference_time.py          # path → latency 추정
+│   ├── set_ss_sb.py               # path → (split_points, BER) 디코더
+│   ├── accuracy.py                # predict_accuracy_res, .npy lookup
+│   ├── gspda.py                   # GSPDA 본체 알고리즘
+│   └── plan.py                    # compute_split_plan() 공개 API + SplitPlan 타입
+│
+├── device/                        # 추론 서버
+│   ├── Dockerfile                 # python:3.10-slim + libhdf5 + TF 2.15
+│   ├── server.py                  # GET /capacity, POST /run, GET /healthz
 │   └── requirements.txt
-├── device/                       # (예정) 공통 추론 서버 이미지
-│   ├── Dockerfile
-│   ├── server.py
+│
+├── orchestrator/                  # 컨트롤 플레인
+│   ├── Dockerfile                 # python:3.10-slim + scipy/sklearn (no TF)
+│   ├── main.py                    # POST /infer, /refresh-capacity, /healthz
+│   ├── config.example.json        # D_tt, D_BER, 임계치 등
 │   └── requirements.txt
-├── model/                        # (예정)
-│   ├── resnet_split.py
-│   └── weights/                  # 학습된 ResNet34 weight (ignore)
-├── policy/                       # (예정) 기존 CRMC 정책 코드 포팅
-│   ├── gspda.py
-│   ├── scheme_low_ber.py
-│   ├── scheme_com_best.py
-│   ├── scheme_min_inter.py
-│   └── shortest_path_graph.py
-└── results/                      # (예정) latency / accuracy 측정 결과 (ignore)
+│
+├── user/                          # 검증 클라이언트
+│   ├── Dockerfile                 # python:3.10-slim + numpy + httpx
+│   ├── client.py                  # CLI: --num-requests, --shuffle, ...
+│   └── requirements.txt
+│
+├── parameter/                     # (gitignore) 학습 weight + 정확도 lookup
+│   ├── ResNet_ImageNet_tf.data-00000-of-00001
+│   ├── ResNet_ImageNet_tf.index
+│   └── acc/
+│       ├── acc_0.npy ~ acc_4.npy            # 1-split lookup
+│       └── acc_0_1.npy ~ acc_3_4.npy        # 2-split lookup
+│
+├── data/                          # (gitignore) 검증 텐서 ~1GB
+│   ├── X_val_s.npy                # (20000, 64, 64, 3) float32 [0,1]
+│   └── y_val_encoded.npy          # (20000,) int32, 200 클래스
+│
+└── resnet34_TinyImageNet/         # 원본 시뮬레이션 코드 (참고용)
+    ├── GSPDA_resnet.py
+    ├── CRMC_eval_*.py
+    ├── Resnet_SC.py
+    └── ...
 ```
 
-## 7. 향후 작업
+---
 
-- [ ] ResNet34 분할 가능한 모델 클래스 구현 (`forward_partial`)
-- [ ] 단일 device 추론 서버 (FastAPI 또는 gRPC) 작성
-- [ ] 기존 CRMC 정책 코드 `policy/` 로 포팅 및 인터페이스 통일
-- [ ] `docker-compose.yml` 작성 + 자원/네트워크 제약 셋업
-- [ ] Orchestrator → 정책 → 분산 추론 end-to-end 연결
-- [ ] 4개 정책 × 다양한 채널 조건에서 실측 latency / accuracy 비교 리포트
+## API
 
-## 8. 참고
+### orchestrator (포트 8080)
 
-- 모델: ResNet34
-- 데이터셋: TinyImageNet
-- 기존 시뮬레이션 코드: `resnet34_TinyImageNet/`
+- `GET /healthz` — `{ok, servers, D_tt, D_BER}` 반환
+- `POST /infer` — 본문 `{tensor_b64, tensor_dtype, tensor_shape}`. 응답 `{predicted_class, logits, end_to_end_latency_ms, compute_ms_per_hop, plan}`
+- `POST /refresh-capacity` — 캐시된 `D_C` 무효화 후 재조회. 실험 중 `COMPUTE_POWER`를 바꿀 때
+
+### device (포트 8000, 내부 전용)
+
+- `GET /capacity` — `{device_id, compute_power}` 반환
+- `POST /run` — multipart (`metadata` JSON form + `tensor` binary file). plan에 따라 자기 slice 실행 후 다음 hop으로 forward, 마지막 hop은 logits을 raw bytes로 응답
+
+---
+
+## 설정
+
+### `orchestrator/config.example.json`
+
+```json
+{
+  "servers": ["server-1", "server-2", "server-3"],
+  "D_tt": [1000, 1000, 1000],   // [s1↔s2, s2↔s3, s1↔s3]
+  "D_BER": [10, 10, 10],         // 같은 ordering
+  "acc_thresh": 0.49,
+  "energy_thresh": 500,
+  "server_port": 8000
+}
+```
+
+### 컨테이너별 주요 env (compose에서 주입)
+
+| 컨테이너 | env | 의미 |
+|---|---|---|
+| server-* | `DEVICE_ID` | `server-1` / `-2` / `-3` |
+| server-* | `COMPUTE_POWER` | 시뮬 `D_C[i]` 값 (3 / 25 / 50) |
+| server-* | `WEIGHT_PATH` | TF checkpoint base path (`/weights/ResNet_ImageNet_tf`) |
+| server-* | `NUM_CLASSES`, `INPUT_SHAPE` | 모델 출력/입력 차원 (`200`, `64,64,3`) |
+| orchestrator | `CONFIG_PATH` | `/app/config.json` |
+| orchestrator | `CRMC_ACC_DATA_DIR` | 정확도 lookup `.npy` 디렉터리 (`/data/acc`) |
+| user | `ORCHESTRATOR_URL` | `http://orchestrator:8080` |
+| user | `NUM_REQUESTS`, `SHUFFLE`, `SEED` | 검증 루프 제어 |
+
+---
+
+## 데이터 준비 (gitignore된 파일)
+
+레포에는 안 올라가지만, 컨테이너가 마운트 받아야 동작합니다.
+
+### `parameter/` — 학습 weight + 정확도 lookup
+- `ResNet_ImageNet_tf.data-00000-of-00001` (~85 MB)
+- `ResNet_ImageNet_tf.index`
+- `acc/acc_*.npy` × 16개
+
+### `data/` — TinyImageNet 검증 텐서
+- `X_val_s.npy`: (20000, 64, 64, 3) float32, 이미 [0,1] 정규화
+- `y_val_encoded.npy`: (20000,) int32, 클래스 0..199
+
+`docker-compose.yml`은 이 두 폴더를 그대로 read-only 볼륨 마운트합니다 — 폴더 위치만 맞으면 별도 설정 없이 바로 동작합니다.
+
+---
+
+## 향후 작업
+
+- [ ] 정책 비교: `low_BER`, `com_best`, `min_inter` 도 `policy/` 로 포팅하여 GSPDA와 latency/accuracy 비교 리포트
+- [ ] `D_tt` 실제 throttling: `tc qdisc rate` 적용해서 시뮬값과 실측 일치 검증
+- [ ] 자동 sweep: `D_tt` / `COMPUTE_POWER` 격자 실험 + 결과 누적 → `results/` 에 CSV
+- [ ] CIFAR-10 weight (`parameter/ResNet_tf.h5`) 도 옵션으로 지원 (소규모 빠른 실험용)
+
+---
+
+## 참고
+
+- 시뮬레이션 원본: <https://github.com/bokyeong0405/CRMC> (`resnet34_TinyImageNet/`)
+- 모델: ResNet34, 데이터셋: TinyImageNet (200 classes)
