@@ -8,6 +8,9 @@ model/weights/
 # containers via docker-compose volumes (see parameter/README references).
 parameter/
 
+# TinyImageNet validation tensors (~1 GB) — mounted into the user container.
+data/
+
 resnet34_TinyImageNet/ResNet_tf.h5
 resnet34_TinyImageNet/ResNet_tf.index
 resnet34_TinyImageNet/ResNet_tf_v2.data-00000-of-00001

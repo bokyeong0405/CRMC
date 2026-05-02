@@ -35,8 +35,8 @@ logger = logging.getLogger("device")
 DEVICE_ID = os.environ["DEVICE_ID"]                                  # required, e.g. "server-1"
 COMPUTE_POWER = float(os.environ.get("COMPUTE_POWER", "1.0"))         # simulation D_C value
 WEIGHT_PATH = os.environ.get("WEIGHT_PATH") or None
-NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "10"))
-INPUT_SHAPE = tuple(int(x) for x in os.environ.get("INPUT_SHAPE", "32,32,3").split(","))
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "200"))                # TinyImageNet
+INPUT_SHAPE = tuple(int(x) for x in os.environ.get("INPUT_SHAPE", "64,64,3").split(","))
 PORT = int(os.environ.get("PORT", "8000"))
 
 app = FastAPI(title=f"CRMC device: {DEVICE_ID}")

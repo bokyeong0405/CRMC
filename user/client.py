@@ -1,72 +1,49 @@
 """CRMC user client.
 
-Sends preprocessed CIFAR-10 test images to the orchestrator's /infer endpoint
-one at a time and prints per-request results plus aggregate accuracy / latency
-stats. The CIFAR-10 dataset is loaded from the standard upstream tarball
-(cached under /tmp) — we deliberately avoid pulling TensorFlow in here so the
-user container stays small.
+Sends preprocessed TinyImageNet validation images to the orchestrator's
+``/infer`` endpoint one at a time and prints per-request results plus
+aggregate accuracy / latency stats.
+
+The validation tensors are loaded from local ``.npy`` files (the upstream
+TinyImageNet preprocessing pipeline already produced ``(64, 64, 3) float32``
+tensors normalised to ``[0, 1]``), so the client doesn't need TF, image
+libraries, or network access — keeping the user container small.
 """
 
 import argparse
 import base64
-import json
 import os
-import pickle
 import statistics
 import sys
-import tarfile
 import time
-from urllib.request import urlretrieve
 
 import httpx
 import numpy as np
 
 
-CIFAR_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
-CIFAR_CACHE_DIR = os.environ.get("CIFAR_CACHE_DIR", "/tmp/cifar10")
-
-CIFAR10_LABELS = [
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck",
-]
+DEFAULT_X_PATH = os.environ.get("X_VAL_PATH", "/data/X_val_s.npy")
+DEFAULT_Y_PATH = os.environ.get("Y_VAL_PATH", "/data/y_val_encoded.npy")
 
 
-def load_cifar10_test():
-    """Return ``(images, labels)`` for the CIFAR-10 test split.
-
-    images: uint8 array of shape (10000, 32, 32, 3) in HWC order
-    labels: int array of shape (10000,)
-    """
-    os.makedirs(CIFAR_CACHE_DIR, exist_ok=True)
-    tar_path = os.path.join(CIFAR_CACHE_DIR, "cifar-10-python.tar.gz")
-    extracted = os.path.join(CIFAR_CACHE_DIR, "cifar-10-batches-py")
-
-    if not os.path.exists(extracted):
-        if not os.path.exists(tar_path):
-            print(f"downloading CIFAR-10 to {tar_path} ...", file=sys.stderr)
-            urlretrieve(CIFAR_URL, tar_path)
-        with tarfile.open(tar_path) as t:
-            t.extractall(CIFAR_CACHE_DIR)
-
-    with open(os.path.join(extracted, "test_batch"), "rb") as f:
-        d = pickle.load(f, encoding="latin1")
-
-    # The pickle stores images as (N, 3072) flat in CHW order.
-    images = d["data"].reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1).astype(np.uint8)
-    labels = np.asarray(d["labels"], dtype=np.int64)
-    return images, labels
+def load_validation(x_path: str, y_path: str):
+    """Memory-map ``X`` (it's ~1 GB) so we don't pay the full RAM cost when
+    the caller only needs a handful of samples."""
+    if not os.path.exists(x_path):
+        raise FileNotFoundError(f"X tensor not found: {x_path}")
+    if not os.path.exists(y_path):
+        raise FileNotFoundError(f"y labels not found: {y_path}")
+    x = np.load(x_path, mmap_mode="r")
+    y = np.load(y_path)
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(f"X/y length mismatch: {x.shape[0]} vs {y.shape[0]}")
+    return x, y
 
 
-def preprocess(image_uint8):
-    """Match the original Resnet_SC.py test pipeline: cast to float32 and
-    normalize to [0, 1]. Add a batch dimension so the device server's
-    ``submodel(x)`` call gets a 4-D tensor."""
-    x = image_uint8.astype(np.float32) / 255.0
-    return x[np.newaxis, ...]  # (1, 32, 32, 3)
+def send_one(client, orchestrator_url, x_image: np.ndarray):
+    # x_image is a single (H, W, C) sample; add a batch dim and copy out of
+    # the mmap into a contiguous buffer so .tobytes() is well-defined.
+    x = np.ascontiguousarray(x_image[np.newaxis, ...], dtype=np.float32)
 
-
-def send_one(client, orchestrator_url, image_uint8):
-    x = preprocess(image_uint8)
     payload = {
         "tensor_b64": base64.b64encode(x.tobytes()).decode("ascii"),
         "tensor_dtype": "float32",
@@ -81,7 +58,7 @@ def send_one(client, orchestrator_url, image_uint8):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CRMC user client")
+    parser = argparse.ArgumentParser(description="CRMC user client (TinyImageNet)")
     parser.add_argument(
         "--orchestrator-url",
         default=os.environ.get("ORCHESTRATOR_URL", "http://orchestrator:8080"),
@@ -90,12 +67,20 @@ def main():
     parser.add_argument(
         "--num-requests", "-n", type=int,
         default=int(os.environ.get("NUM_REQUESTS", "10")),
-        help="how many test images to send (default: env NUM_REQUESTS or 10)",
+        help="how many validation images to send (default: env NUM_REQUESTS or 10)",
+    )
+    parser.add_argument(
+        "--x-path", default=DEFAULT_X_PATH,
+        help=f"path to X_val tensor (default: env X_VAL_PATH or {DEFAULT_X_PATH})",
+    )
+    parser.add_argument(
+        "--y-path", default=DEFAULT_Y_PATH,
+        help=f"path to y_val labels (default: env Y_VAL_PATH or {DEFAULT_Y_PATH})",
     )
     parser.add_argument(
         "--shuffle", action="store_true",
         default=os.environ.get("SHUFFLE", "").lower() in ("1", "true", "yes"),
-        help="pick test images at random (default: in order)",
+        help="pick validation images at random (default: in order)",
     )
     parser.add_argument(
         "--seed", type=int,
@@ -108,13 +93,15 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"loading CIFAR-10 test split ...", file=sys.stderr)
-    images, labels = load_cifar10_test()
+    print(f"loading validation tensors from {args.x_path} / {args.y_path} ...", file=sys.stderr)
+    x_val, y_val = load_validation(args.x_path, args.y_path)
+    print(f"  X: {x_val.shape} {x_val.dtype}   y: {y_val.shape} ({len(np.unique(y_val))} classes)",
+          file=sys.stderr)
 
-    n = min(args.num_requests, len(images))
+    n = min(args.num_requests, len(x_val))
     if args.shuffle:
         rng = np.random.default_rng(args.seed)
-        indices = rng.choice(len(images), size=n, replace=False)
+        indices = rng.choice(len(x_val), size=n, replace=False)
     else:
         indices = np.arange(n)
 
@@ -127,9 +114,9 @@ def main():
 
     with httpx.Client(timeout=args.timeout) as client:
         for i, idx in enumerate(indices):
-            true_label = int(labels[idx])
+            true_label = int(y_val[idx])
             try:
-                res, wall_ms = send_one(client, args.orchestrator_url, images[idx])
+                res, wall_ms = send_one(client, args.orchestrator_url, x_val[idx])
             except httpx.HTTPError as e:
                 print(f"[{i + 1}/{n}] request failed: {e}", file=sys.stderr)
                 continue
@@ -155,8 +142,7 @@ def main():
 
             mark = "OK" if is_correct else "  "
             print(
-                f"[{i + 1:>3}/{n}] true={CIFAR10_LABELS[true_label]:<10} "
-                f"pred={CIFAR10_LABELS[pred]:<10} {mark}  "
+                f"[{i + 1:>3}/{n}] true={true_label:>3} pred={pred:>3} {mark}  "
                 f"orch={res['end_to_end_latency_ms']:>7.1f}ms  "
                 f"wall={wall_ms:>7.1f}ms  "
                 f"hops={res.get('compute_ms_per_hop', '')}"
