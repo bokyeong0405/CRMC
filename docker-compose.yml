@@ -1,0 +1,143 @@
+# CRMC distributed inference — 5-container setup
+#
+#   user ──HTTP──▶ orchestrator ──HTTP──▶ server-1 ──▶ server-2 ──▶ server-3 ──▶ ...
+#                                                       (chain order is decided by GSPDA)
+#
+# Run:
+#   docker compose build                                         # build all 3 images
+#   docker compose up -d server-1 server-2 server-3 orchestrator # start servers + orch
+#   docker compose run --rm user                                 # send N requests, exit
+#   docker compose down                                          # tear it all down
+
+# ─── reusable anchors ────────────────────────────────────────────────
+# YAML merge keys (<<: *anchor) let us write common config once and reuse
+# it. Compose ignores any top-level field starting with ``x-`` so these
+# are pure scaffolding.
+
+x-device-env: &device-env
+  WEIGHT_PATH: /weights/ResNet_ImageNet_tf
+  NUM_CLASSES: "200"
+  INPUT_SHAPE: "64,64,3"
+  PORT: "8000"
+
+x-device-base: &device-base
+  build:
+    context: .                         # build context is the repo root
+    dockerfile: device/Dockerfile
+  image: crmc/device:latest
+  volumes:
+    # TF checkpoint format is a sharded data file + an index file; both
+    # are needed for model.load_weights to succeed.
+    - ./parameter/ResNet_ImageNet_tf.data-00000-of-00001:/weights/ResNet_ImageNet_tf.data-00000-of-00001:ro
+    - ./parameter/ResNet_ImageNet_tf.index:/weights/ResNet_ImageNet_tf.index:ro
+  networks:
+    - crmc
+  restart: unless-stopped
+
+
+services:
+  # ─── 3 inference servers ────────────────────────────────────────────
+  # COMPUTE_POWER values mirror the simulation's D_C = [3, 25, 50] and are
+  # what GSPDA uses to decide the split policy. The cgroup ``cpus:`` limit
+  # additionally throttles the container so end-to-end timing reflects the
+  # disparity (otherwise every container runs at full host speed and only
+  # GSPDA's *predicted* latency would differ).
+
+  server-1:
+    <<: *device-base
+    container_name: crmc-server-1
+    environment:
+      <<: *device-env
+      DEVICE_ID: server-1
+      COMPUTE_POWER: "3"               # simulation D_C[0] — slow edge device
+    cpus: 0.2
+    mem_limit: 2g
+
+  server-2:
+    <<: *device-base
+    container_name: crmc-server-2
+    environment:
+      <<: *device-env
+      DEVICE_ID: server-2
+      COMPUTE_POWER: "25"              # simulation D_C[1]
+    cpus: 1.0
+    mem_limit: 2g
+
+  server-3:
+    <<: *device-base
+    container_name: crmc-server-3
+    environment:
+      <<: *device-env
+      DEVICE_ID: server-3
+      COMPUTE_POWER: "50"              # simulation D_C[2] — most powerful
+    cpus: 2.0
+    mem_limit: 2g
+
+  # ─── Orchestrator (control plane) ───────────────────────────────────
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    image: crmc/orchestrator:latest
+    container_name: crmc-orchestrator
+    volumes:
+      # config.json holds D_tt, D_BER, server list, thresholds — the
+      # parts of the GSPDA input that aren't measured at runtime.
+      - ./orchestrator/config.example.json:/app/config.json:ro
+      # Accuracy lookup .npy files used by policy.accuracy.predict_accuracy_res.
+      - ./parameter/acc:/data/acc:ro
+    environment:
+      CONFIG_PATH: /app/config.json
+      CRMC_ACC_DATA_DIR: /data/acc
+      PORT: "8080"
+    ports:
+      # Expose 8080 to the host so we can curl /healthz from outside the
+      # compose network for debugging. Removing this is fine — the user
+      # container reaches the orchestrator via the internal DNS regardless.
+      - "8080:8080"
+    networks:
+      - crmc
+    depends_on:
+      - server-1
+      - server-2
+      - server-3
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+
+  # ─── User client (one-shot job, not a long-running service) ─────────
+  user:
+    build:
+      context: .
+      dockerfile: user/Dockerfile
+    image: crmc/user:latest
+    container_name: crmc-user
+    volumes:
+      # 1 GB of preprocessed TinyImageNet validation tensors — mmap'd
+      # inside the container, so we don't pay the full RAM cost.
+      - ./data:/data:ro
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      X_VAL_PATH: /data/X_val_s.npy
+      Y_VAL_PATH: /data/y_val_encoded.npy
+      NUM_REQUESTS: "10"
+      SHUFFLE: "1"
+      SEED: "0"
+    networks:
+      - crmc
+    depends_on:
+      - orchestrator
+    # Run the client once and exit. ``docker compose run --rm user`` is
+    # the typical invocation; ``docker compose up user`` works too but
+    # won't restart on exit.
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 1g
+
+networks:
+  crmc:
+    driver: bridge
+    # Inside this network, the service name (or container_name) is
+    # DNS-resolvable. That's how the user reaches
+    # ``http://orchestrator:8080`` and how server-1 POSTs to
+    # ``http://server-2:8000/run``.
